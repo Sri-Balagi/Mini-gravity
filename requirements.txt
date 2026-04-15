@@ -1,0 +1,13 @@
+groq
+gradio
+requests
+python-dotenv
+transformers
+torch 
+torchaudio
+PyPDF2
+python-docx
+python-pptx
+pandas
+openpyxl
+streamlit
