@@ -16,7 +16,7 @@ st.markdown("""
     /* Styling Streamlit Main App */
     .stApp {
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        background: linear-gradient(-45deg, #000000, #001f3f, #ff1493, #000000);
+        background: linear-gradient(-45deg, #000000, #001f3f, #000000, #001f3f);
         background-size: 400% 400%;
         animation: gradientBG 15s ease infinite;
     }
@@ -100,11 +100,13 @@ with st.sidebar:
         if "code written to" in res_str:
             file_path = res_str.split("code written to ")[-1].strip()
             if os.path.exists(file_path):
+                prog_input = st.text_input("Program Input (Optional):", key=f"prog_input_{idx}", help="Data to pass to input() function")
                 if st.button("▶️ Run Program", key=f"run_btn_{idx}"):
                     import subprocess
                     st.info(f"Running `{os.path.basename(file_path)}`...")
                     try:
-                        proc = subprocess.run([sys.executable, file_path], capture_output=True, text=True, timeout=5)
+                        cmd_input = prog_input + "\n" if prog_input else None
+                        proc = subprocess.run([sys.executable, file_path], input=cmd_input, capture_output=True, text=True, timeout=5)
                         if proc.stdout:
                             st.success("Output:")
                             st.code(proc.stdout)
@@ -126,6 +128,7 @@ input_type = st.selectbox(
 user_text=None
 audio_file=None
 uploaded_file=None
+file_cmd_audio=None   # audio command used in File mode
 
 if input_type=="Text":
     user_text=st.text_area("Enter your command")
@@ -134,23 +137,52 @@ elif input_type=="Audio":
     if not audio_file:
         audio_file = st.file_uploader("Or upload an existing audio file", type=["wav", "mp3", "m4a", "ogg"])
 elif input_type=="File":
-    uploaded_file=st.file_uploader("Upload document")
-    user_text=st.text_area("Enter your command for the document")
+    uploaded_file = st.file_uploader("📄 Upload document (PDF, DOCX, XLSX, PPTX, TXT)")
+    st.markdown("**How do you want to give your command?**")
+    cmd_tab1, cmd_tab2, cmd_tab3 = st.tabs(["⌨️ Type", "🎙️ Record Voice", "📁 Upload Audio"])
+    with cmd_tab1:
+        user_text = st.text_area("Enter your command for the document", key="file_cmd_text")
+    with cmd_tab2:
+        file_cmd_audio = st.audio_input("Record your command", key="file_cmd_live")
+    with cmd_tab3:
+        file_cmd_audio = file_cmd_audio or st.file_uploader(
+            "Upload audio command", type=["wav","mp3","m4a","ogg"], key="file_cmd_upload"
+        )
 
 # Function to run the app
 if st.button("Run"):
     text = ""
     # 🔹 FILE MODE
     if input_type == "File":
-        if not uploaded_file or not user_text:
-            st.warning("Please upload a file and enter a command.")
+        if not uploaded_file:
+            st.warning("Please upload a document first.")
             st.stop()
-        text = user_text
+
+        # Save the uploaded document
         file_path = os.path.join(BASE_DIR, "output", uploaded_file.name)
         os.makedirs(os.path.join(BASE_DIR, "output"), exist_ok=True)
         with open(file_path, "wb") as f:
             f.write(uploaded_file.read())
         st.session_state.uploaded_file_path = file_path
+
+        # Resolve the command — typed text takes priority, then audio
+        if user_text and user_text.strip():
+            text = user_text.strip()
+        elif file_cmd_audio is not None:
+            try:
+                audio_path = os.path.join(BASE_DIR, "input", file_cmd_audio.name)
+                os.makedirs(os.path.join(BASE_DIR, "input"), exist_ok=True)
+                with open(audio_path, "wb") as f:
+                    f.write(file_cmd_audio.read())
+                st.info("Transcribing voice command...")
+                text = transcribe_audio(audio_path)
+                st.success(f"Transcription: {text}")
+            except Exception as e:
+                st.error(f"Failed to transcribe audio command: {e}")
+                st.stop()
+        else:
+            st.warning("Please type or record a command for the document.")
+            st.stop()
 
     # 🔹 TEXT MODE
     elif input_type == "Text":
@@ -158,7 +190,6 @@ if st.button("Run"):
             st.warning("Enter text")
             st.stop()
         text = user_text
-        st.session_state.uploaded_file_path = None
 
     # 🔹 AUDIO MODE
     elif input_type == "Audio":
@@ -173,7 +204,6 @@ if st.button("Run"):
             st.info("Transcribing audio...")
             text = transcribe_audio(file_path)
             st.success(f"Transcription: {text}")
-            st.session_state.uploaded_file_path = None
         except Exception as e:
             st.error(f"Failed to transcribe audio: {e}")
             st.stop()
@@ -181,16 +211,22 @@ if st.button("Run"):
     if text:
         st.info("Detecting intent...")
         try:
-            intents = classify_intent(text)
+            # Context-aware classification
+            context_file = os.path.basename(st.session_state.uploaded_file_path) if st.session_state.uploaded_file_path else None
+            intents = classify_intent(text, context_file=context_file)
+            
             if isinstance(intents, dict):
                 intents = [intents]
             
-            # Inject uploaded file path if needed
+            # Inject active file path into ALL intents for contextual awareness
             if st.session_state.uploaded_file_path:
                 for intent in intents:
-                    if intent.get("intent") == "summarize":
-                        if "details" not in intent:
-                            intent["details"] = {}
+                    if "details" not in intent:
+                        intent["details"] = {}
+                    # Only inject if filename is empty or refers to the context file
+                    details = intent["details"]
+                    detected_file = str(details.get("filename", "")).lower()
+                    if not detected_file or detected_file in ["this file", "the document", "it", str(context_file).lower()]:
                         intent["details"]["file_path"] = st.session_state.uploaded_file_path
 
             st.session_state.pending_intents = intents

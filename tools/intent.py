@@ -1,10 +1,15 @@
-import subprocess
+import requests
 import json
 import re
 
-def classify_intent(text:str) -> list:
+def classify_intent(text:str, context_file:str=None) -> list:
+    context_hint = ""
+    if context_file:
+        context_hint = f"\n[CONTEXT]: The user currently has a file named '{context_file}' uploaded and active. If the user refers to 'the file', 'this document', 'it', or provides a name that is phonetically similar to '{context_file}', you MUST use '{context_file}' as the filename."
+
     prompt = f"""
 You are a STRICT intent classifier. Your job is to read a user request and output a JSON array.
+{context_hint}
 
 Supported intents:
 1. create_file   - when the user asks to create an empty file or a folder
@@ -18,29 +23,33 @@ Supported intents:
 9. general_chat  - everything else (questions, greetings, explanations)
 
 CRITICAL RULES:
+- If a context file is provided and the user says 'Summarize this' or 'Delete the document', use the context file name for the 'filename' field.
 - A single user request = a SINGLE task. Do NOT split one request into multiple tasks.
-  BAD:  user says "write a calculator with a GUI" → two tasks (write_code + create_file)  ← WRONG
-  GOOD: user says "write a calculator with a GUI" → one task (write_code, instruction contains FULL description including GUI requirement)  ← CORRECT
-- Do NOT fabricate extra tasks that the user did not ask for.
-- The "instruction" field must preserve the FULL user intent word-for-word, including ALL requested features (GUI, buttons, style, etc.).
 - If user asks for ANY app or program → ALWAYS choose "write_code".
-- Do NOT include any explanation, commentary, or text outside the JSON array.
 - Return ONLY a valid JSON array. No markdown fences, no trailing commas, no comments.
 
-Output format (strictly follow this, do not deviate):
+Output format:
 [{{"intent": "<intent>", "details": {{"filename": "<filename>", "instruction": "<full instruction from user>"}}}}]
 
 User input:
 "{text}"
 """
-    result=subprocess.run(
-        ["ollama", "run", "deepseek-coder:6.7B"],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        encoding="utf-8"
-    )
-    raw_output = result.stdout.strip()
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "deepseek-coder:6.7B",
+                "prompt": prompt,
+                "stream": False
+            },
+            timeout=120
+        )
+        response.raise_for_status()
+        raw_output = response.json().get("response", "").strip()
+    except Exception as e:
+        print(f"Ollama API Error: {e}")
+        raw_output = ""
+
     print("RAW OUTPUT:", raw_output)
 
     # ── pre-sanitise BEFORE extracting JSON ────────────────────────────────

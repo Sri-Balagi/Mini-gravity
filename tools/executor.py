@@ -2,6 +2,7 @@ import os
 import subprocess
 import re
 import shutil
+import requests
 
 BASE_DIR=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR=os.path.join(BASE_DIR,"output")
@@ -61,10 +62,8 @@ def create_file(details:dict):
 
 
 def delete_file(details):
-    filename=extract_filename(details)
-    filename=os.path.basename(filename)
-    file_path=os.path.join(OUTPUT_DIR,filename)
-    if not os.path.exists(file_path):
+    file_path = resolve_path(details)
+    if not file_path or not os.path.exists(file_path):
         raise Exception("File not found")
     if os.path.isdir(file_path):
         shutil.rmtree(file_path)
@@ -73,14 +72,13 @@ def delete_file(details):
     return f"Deleted {file_path}"
     
 def rename_file(details):
-    old=os.path.basename(details.get("old_name"))
-    new=os.path.basename(details.get("new_name"))
-    old_path=os.path.join(OUTPUT_DIR,old)
-    new_path=os.path.join(OUTPUT_DIR,new)
+    old_path = resolve_path(details, "old_name")
+    new_name = os.path.basename(details.get("new_name", "renamed_file"))
+    new_path = os.path.join(OUTPUT_DIR, new_name)
 
-    if not os.path.exists(old_path):
-        raise Exception("File Not Found")
-    os.rename(old_path,new_path)
+    if not old_path or not os.path.exists(old_path):
+        raise Exception("Original File Not Found")
+    os.rename(old_path, new_path)
     return f"Renamed {old_path} to {new_path}"
 
 def move_file(details):
@@ -100,9 +98,11 @@ def move_file(details):
     return f"Moved {src_path} to {dest_path}"
 
 def modify_file(details):
-    filename=extract_filename(details)
-    instruction=extract_instruction(details)
-    file_path=os.path.join(OUTPUT_DIR,os.path.basename(filename))
+    instruction = extract_instruction(details)
+    file_path = resolve_path(details)
+    
+    if not file_path or not os.path.exists(file_path):
+        raise Exception("File to modify not found")
     
     with open(file_path,"r",encoding="utf-8") as f:
         content=f.read()
@@ -115,25 +115,52 @@ def modify_file(details):
     {content}
     """
 
-    result=subprocess.run(
-        ["ollama","run","deepseek-coder:6.7B"],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        encoding="utf-8"
-    )
-    updated_code=clean_code(result.stdout)
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": "deepseek-coder:6.7B", "prompt": prompt, "stream": False},
+            timeout=300
+        )
+        response.raise_for_status()
+        updated_code = clean_code(response.json().get("response", ""))
+    except Exception as e:
+        raise Exception(f"Ollama API Error: {e}")
 
     with open(file_path,"w",encoding="utf-8") as f:
         f.write(updated_code)
     return f"updated {file_path}"
 
+def resolve_path(details, filename_key="filename"):
+    injected = details.get("file_path")
+    if injected and os.path.exists(injected):
+        return injected
+    
+    filename = details.get(filename_key) or extract_filename(details)
+    if filename:
+        return os.path.join(OUTPUT_DIR, os.path.basename(filename))
+    return None
+
+def _derive_filename(instruction: str) -> str:
+    """Derive a safe snake_case .py filename from the instruction text."""
+    # Take the first 5 meaningful words, lowercase, join with underscores
+    words = re.sub(r'[^a-zA-Z0-9\s]', '', instruction).lower().split()
+    stop = {"a","an","the","me","please","using","with","in","to","for","i","you","that","is","want"}
+    keywords = [w for w in words if w not in stop][:4]
+    name = "_".join(keywords) if keywords else "program"
+    return name + ".py"
+
 def write_code(details:dict,retries=3):
     filename=extract_filename(details)
     instruction=extract_instruction(details)
     
-    if not filename or not instruction:
-        raise Exception("Filename or Instruction not found")
+    if not instruction:
+        raise Exception("Instruction not found — please describe what to build.")
+
+    # Auto-generate filename from instruction if LLM didn't supply one
+    if not filename or not filename.strip():
+        filename = _derive_filename(instruction)
+        print(f"No filename provided by model; derived: {filename}")
+
     #file creation
     filename=os.path.basename(filename)
     os.makedirs(OUTPUT_DIR,exist_ok=True)
@@ -155,6 +182,7 @@ RULES — READ CAREFULLY:
 4. Every imported module must be used.  Every function must have a body.
 5. Handle obvious runtime errors (division by zero, empty input, etc.).
 6. Use clear, descriptive variable and function names.
+7. DO NOT hardcode test values! If the program requires values to compute, you MUST accept them interactively using the `input()` function so the user can test different parameters.
 
 OUTPUT FORMAT — CRITICAL:
 - Return ONLY raw source code.
@@ -162,20 +190,16 @@ OUTPUT FORMAT — CRITICAL:
 - The very first character of your response must be the first character of the code.
 """
 
-    result=subprocess.run(
-        ["ollama","run","deepseek-coder:6.7B"],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        encoding="utf-8"
-    )
-
-    raw_stdout = result.stdout.strip()
-
-    # Strip ANSI/VT100 escape sequences that Ollama emits for its progress display
-    # These include cursor-up, erase-line, etc. that corrupt the extracted code
-    raw_stdout = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', raw_stdout)     # CSI sequences
-    raw_stdout = re.sub(r'\x1b[>=?]', '', raw_stdout)                  # other ESC codes
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": "deepseek-coder:6.7B", "prompt": prompt, "stream": False},
+            timeout=300
+        )
+        response.raise_for_status()
+        raw_stdout = response.json().get("response", "").strip()
+    except Exception as e:
+        raise Exception(f"Ollama API Error: {e}")
 
     code = clean_code(raw_stdout)
 
@@ -200,21 +224,21 @@ def repair_code(code):
     CODE:
     {code}
     """
-    result=subprocess.run(
-        ["ollama","run","deepseek-coder:6.7B"],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        encoding="utf-8"
-    )
-    return clean_code(result.stdout)
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": "deepseek-coder:6.7B", "prompt": prompt, "stream": False},
+            timeout=300
+        )
+        response.raise_for_status()
+        return clean_code(response.json().get("response", ""))
+    except Exception as e:
+        raise Exception(f"Ollama API Error: {e}")
 
 def repair_file(details:dict):
-    filename=extract_filename(details)
-    filename=os.path.basename(filename)
-    file_path=os.path.join(OUTPUT_DIR,filename)
-    if not os.path.exists(file_path):
-        raise Exception("File not found")
+    file_path = resolve_path(details)
+    if not file_path or not os.path.exists(file_path):
+        raise Exception("File to repair not found")
     with open(file_path,"r",encoding="utf-8") as f:
         code=f.read()
     fixed_code=repair_code(code)
@@ -276,32 +300,44 @@ def extract_text_from_file(file_path):
     
 def summarize(details):
     filename = details.get("filename")
-    text = details.get("text") or details.get("instruction")
+    injected_path = details.get("file_path")   # absolute path injected by the UI
+    text = None
     filepath = None
 
-    if filename:
+    # Priority 1: absolute file_path injected by the UI (uploaded document)
+    if injected_path and os.path.exists(injected_path):
+        text = extract_text_from_file(injected_path)
+        filepath = injected_path
+
+    # Priority 2: filename provided by the LLM → resolve against output dir
+    elif filename and filename.strip():
         filepath = os.path.join(OUTPUT_DIR, os.path.basename(filename))
         if os.path.exists(filepath):
             text = extract_text_from_file(filepath)
         else:
-            raise Exception("File not found")
+            raise Exception(f"File not found: {filepath}")
 
-    if not text and not filepath:
-        raise Exception("No input provided")
+    # Priority 3: raw text / instruction passed directly
+    if not text:
+        text = details.get("text") or details.get("instruction")
+
+    if not text:
+        raise Exception("No content to summarize — please upload a file or provide text.")
 
     prompt = f"""Summarize the following text accurately.
 Highlight key sections and important details only.
 {text}"""
 
-    result = subprocess.run(
-        ["ollama", "run", "qwen2.5:7b"],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        encoding="utf-8"
-    )
-
-    return result.stdout.strip()
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": "qwen2.5:7b", "prompt": prompt, "stream": False},
+            timeout=300
+        )
+        response.raise_for_status()
+        return response.json().get("response", "").strip()
+    except Exception as e:
+        raise Exception(f"Ollama API Error: {e}")
 
 def general_chat(details):
     user_input = details.get("text") or details.get("query") or details.get("instruction") or details.get("user_message")
@@ -309,14 +345,16 @@ def general_chat(details):
         user_input = " ".join(str(v) for v in details.values())
     if not user_input:
         raise Exception("No input for chat")
-    result=subprocess.run(
-        ["ollama","run","qwen2.5:7b"],
-        input=user_input,
-        capture_output=True,
-        text=True,
-        encoding="utf-8"
-    )
-    return result.stdout.strip()
+    try:
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": "qwen2.5:7b", "prompt": user_input, "stream": False},
+            timeout=300
+        )
+        response.raise_for_status()
+        return response.json().get("response", "").strip()
+    except Exception as e:
+        raise Exception(f"Ollama API Error: {e}")
 
 def execute(intent_data:dict):
     intent=intent_data.get("intent")
